@@ -80,7 +80,9 @@ npm run preview
 4. Deploy!
 
 ### GitHub Pages
-Configure your GitHub Actions workflow to build with `npm run build` and deploy the generated `dist/` folder using the GitHub Pages static deployment action.
+1. Go to your GitHub repository: **Settings** > **Pages**.
+2. Under **Build and deployment** > **Source**, select **GitHub Actions**.
+3. Push your code to the `main` branch. The automated workflow `.github/workflows/deploy.yml` will automatically build the Vite app and deploy the compiled `dist` directory.
 
 ---
 
