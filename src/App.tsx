@@ -14,12 +14,37 @@ import { ShareModal } from './components/ShareModal';
 import { MembersDrawer } from './components/MembersDrawer';
 import { DocsModal } from './components/DocsModal';
 import { SecurityTestModal } from './components/SecurityTestModal';
+import { MultiRoomTabBar, OpenRoomSession } from './components/MultiRoomTabBar';
 import { roomEngine } from './services/roomEngine';
 import { Room, RoomMember, Message, BanRecord, JoinRequest, JoinMode } from './types';
 
 export default function App() {
-  const [activeRoom, setActiveRoom] = useState<Room | null>(null);
-  const [currentMember, setCurrentMember] = useState<RoomMember | null>(null);
+  const [openRooms, setOpenRooms] = useState<OpenRoomSession[]>(() => {
+    try {
+      const saved = sessionStorage.getItem('chatroom_v1_open_tabs');
+      if (saved) return JSON.parse(saved);
+    } catch {
+      // ignore
+    }
+    return [];
+  });
+  const [activeRoomId, setActiveRoomId] = useState<string | null>(() => {
+    try {
+      const saved = sessionStorage.getItem('chatroom_v1_open_tabs');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 0) return parsed[0].room.id;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  });
+
+  const activeSession = openRooms.find((s) => s.room.id === activeRoomId) || null;
+  const activeRoom = activeSession?.room || null;
+  const currentMember = activeSession?.session || null;
+
   const [allRooms, setAllRooms] = useState<Room[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
   const [members, setMembers] = useState<RoomMember[]>([]);
@@ -36,12 +61,24 @@ export default function App() {
   const [isDocsOpen, setIsDocsOpen] = useState(false);
   const [isSecurityOpen, setIsSecurityOpen] = useState(false);
 
+  // Sync open rooms to session storage
+  useEffect(() => {
+    try {
+      sessionStorage.setItem('chatroom_v1_open_tabs', JSON.stringify(openRooms));
+    } catch {
+      // ignore
+    }
+  }, [openRooms]);
+
   // Refresh active room data
   const refreshRoomData = useCallback(() => {
     if (!activeRoom) return;
     const r = roomEngine.getRoomById(activeRoom.id);
     if (r) {
-      setActiveRoom({ ...r });
+      // Update room in openRooms if changed
+      setOpenRooms((prev) =>
+        prev.map((item) => (item.room.id === r.id ? { ...item, room: { ...r } } : item))
+      );
       setMessages([...roomEngine.getMessages(r.id)]);
       const currentM = roomEngine.getMembers(r.id);
       setMembers([...currentM]);
@@ -54,10 +91,15 @@ export default function App() {
         const isBanned = roomEngine.getBans(r.id).some((b) => b.session_id === currentMember.session_id);
         if (!updatedSelf || isBanned) {
           alert('You have been removed or banned from this room.');
-          setActiveRoom(null);
-          setCurrentMember(null);
+          setOpenRooms((prev) => prev.filter((item) => item.room.id !== r.id));
+          setActiveRoomId((prevId) => (prevId === r.id ? null : prevId));
         } else {
-          setCurrentMember({ ...updatedSelf });
+          // Update member session
+          setOpenRooms((prev) =>
+            prev.map((item) =>
+              item.room.id === r.id ? { ...item, session: { ...updatedSelf } } : item
+            )
+          );
         }
       }
     }
@@ -65,11 +107,9 @@ export default function App() {
 
   // Load all rooms for home listing
   const refreshAllRooms = useCallback(() => {
-    // Collect from storage
     const demo = roomEngine.getRoomByCode('X7K9PQ');
     const list: Room[] = [];
     if (demo) list.push(demo);
-    // Add any others
     try {
       const stored = localStorage.getItem('chatroom_v1_rooms');
       if (stored) {
@@ -86,19 +126,51 @@ export default function App() {
     setAllRooms(list);
   }, []);
 
-  // Listen to cross-tab / local sync events
+  // Switch to room whenever activeRoomId changes
+  useEffect(() => {
+    if (activeRoomId) {
+      const target = openRooms.find((s) => s.room.id === activeRoomId);
+      if (target) {
+        setMessages(roomEngine.getMessages(target.room.id));
+        setMembers(roomEngine.getMembers(target.room.id));
+        setBans(roomEngine.getBans(target.room.id));
+        setRequests(roomEngine.getJoinRequests(target.room.id));
+      }
+    }
+  }, [activeRoomId, openRooms]);
+
+  // Listen to cross-tab / network sync events
   useEffect(() => {
     refreshAllRooms();
     const unsubscribe = roomEngine.subscribeToSyncEvents?.((event) => {
-      if (activeRoom && (event.payload as { roomId?: string })?.roomId === activeRoom.id) {
-        refreshRoomData();
+      const eventRoomId = (event.payload as { roomId?: string })?.roomId;
+
+      if (eventRoomId) {
+        // Increment unread count for background open rooms
+        if (event.type === 'MESSAGE_RECEIVED') {
+          setOpenRooms((prev) =>
+            prev.map((s) => {
+              if (s.room.id === eventRoomId && s.room.id !== activeRoomId) {
+                return { ...s, unreadCount: s.unreadCount + 1 };
+              }
+              return s;
+            })
+          );
+        }
+
+        // If affects currently visible room, refresh data
+        if (eventRoomId === activeRoomId) {
+          refreshRoomData();
+        }
       }
+
       refreshAllRooms();
     });
+
     return () => {
       if (unsubscribe) unsubscribe();
     };
-  }, [activeRoom, refreshRoomData, refreshAllRooms]);
+  }, [activeRoomId, refreshRoomData, refreshAllRooms]);
 
   // Detect URL parameter on initial mount e.g. ?r=X7K9PQ
   useEffect(() => {
@@ -110,7 +182,7 @@ export default function App() {
     }
   }, []);
 
-  // Handle Room Creation
+  // Room Creation Handler
   const handleCreateRoom = (params: {
     name: string;
     ownerUsername: string;
@@ -124,24 +196,35 @@ export default function App() {
     return result;
   };
 
-  const handleCreateSuccess = (room: Room, session: RoomMember) => {
-    setActiveRoom(room);
-    setCurrentMember(session);
-    setMessages(roomEngine.getMessages(room.id));
-    setMembers(roomEngine.getMembers(room.id));
-    setBans(roomEngine.getBans(room.id));
-    setRequests(roomEngine.getJoinRequests(room.id));
+  const handleJoinSuccess = (room: Room, session: RoomMember) => {
+    setOpenRooms((prev) => {
+      const existingIdx = prev.findIndex((s) => s.room.id === room.id);
+      if (existingIdx !== -1) {
+        const copy = [...prev];
+        copy[existingIdx] = { room, session, unreadCount: 0 };
+        return copy;
+      }
+      return [...prev, { room, session, unreadCount: 0 }];
+    });
+    setActiveRoomId(room.id);
     refreshAllRooms();
   };
 
-  const handleJoinSuccess = (room: Room, session: RoomMember) => {
-    setActiveRoom(room);
-    setCurrentMember(session);
-    setMessages(roomEngine.getMessages(room.id));
-    setMembers(roomEngine.getMembers(room.id));
-    setBans(roomEngine.getBans(room.id));
-    setRequests(roomEngine.getJoinRequests(room.id));
-    refreshAllRooms();
+  const handleSelectRoom = (roomId: string) => {
+    setActiveRoomId(roomId);
+    setOpenRooms((prev) =>
+      prev.map((item) => (item.room.id === roomId ? { ...item, unreadCount: 0 } : item))
+    );
+  };
+
+  const handleCloseRoom = (roomId: string) => {
+    setOpenRooms((prev) => {
+      const remaining = prev.filter((item) => item.room.id !== roomId);
+      if (activeRoomId === roomId) {
+        setActiveRoomId(remaining.length > 0 ? remaining[0].room.id : null);
+      }
+      return remaining;
+    });
   };
 
   // Launch Demo Room
@@ -159,21 +242,26 @@ export default function App() {
   const handleLeaveRoom = () => {
     if (activeRoom && currentMember) {
       roomEngine.leaveRoom(activeRoom.id, currentMember.session_id);
+      handleCloseRoom(activeRoom.id);
     }
-    setActiveRoom(null);
-    setCurrentMember(null);
     refreshAllRooms();
   };
 
   const handleSwitchIdentity = (targetMember: RoomMember) => {
-    setCurrentMember(targetMember);
+    if (activeRoom) {
+      setOpenRooms((prev) =>
+        prev.map((item) =>
+          item.room.id === activeRoom.id ? { ...item, session: targetMember } : item
+        )
+      );
+    }
   };
 
   const handleResetData = () => {
     if (confirm('Reset all demo data and restore initial clean room state?')) {
       roomEngine.resetAllData();
-      setActiveRoom(null);
-      setCurrentMember(null);
+      setOpenRooms([]);
+      setActiveRoomId(null);
       refreshAllRooms();
     }
   };
@@ -186,16 +274,28 @@ export default function App() {
         onOpenDocs={() => setIsDocsOpen(true)}
         onOpenSecurityTests={() => setIsSecurityOpen(true)}
         onResetData={handleResetData}
-        onGoHome={() => {
-          setActiveRoom(null);
-          setCurrentMember(null);
+        onGoHome={() => setActiveRoomId(null)}
+      />
+
+      {/* Multi-Room Parallel Tabs Bar */}
+      <MultiRoomTabBar
+        openRooms={openRooms}
+        activeRoomId={activeRoomId}
+        onSelectRoom={handleSelectRoom}
+        onGoHome={() => setActiveRoomId(null)}
+        onCloseRoom={handleCloseRoom}
+        onOpenJoin={() => {
+          setJoinInitialCode('');
+          setIsJoinOpen(true);
         }}
+        onOpenCreate={() => setIsCreateOpen(true)}
       />
 
       {/* Main View Area */}
-      <main className="flex-1 flex flex-col">
+      <main className="flex-1 flex flex-col overflow-hidden">
         {activeRoom && currentMember ? (
           <ChatRoomView
+            key={activeRoom.id}
             room={activeRoom}
             currentMember={currentMember}
             members={members}
@@ -226,7 +326,7 @@ export default function App() {
       <CreateRoomModal
         isOpen={isCreateOpen}
         onClose={() => setIsCreateOpen(false)}
-        onCreateSuccess={handleCreateSuccess}
+        onCreateSuccess={handleJoinSuccess}
         onCreate={handleCreateRoom}
       />
 

@@ -21,26 +21,49 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
+  const [isSearching, setIsSearching] = useState(false);
   const [pendingApproval, setPendingApproval] = useState(false);
   const [targetRoom, setTargetRoom] = useState<Room | null>(null);
 
   useEffect(() => {
+    let active = true;
     if (initialCode) {
-      setCode(initialCode.toUpperCase());
-      const r = roomEngine.getRoomByCode(initialCode);
-      setTargetRoom(r);
+      const clean = initialCode.trim().toUpperCase();
+      setCode(clean);
+      const r = roomEngine.getRoomByCode(clean);
+      if (r) {
+        setTargetRoom(r);
+      } else {
+        roomEngine.resolveRoomByCode(clean, 2500).then((netRoom) => {
+          if (active && netRoom) setTargetRoom(netRoom);
+        });
+      }
     } else {
       setTargetRoom(null);
     }
+    return () => {
+      active = false;
+    };
   }, [initialCode, isOpen]);
 
   useEffect(() => {
-    if (code.length >= 4) {
-      const r = roomEngine.getRoomByCode(code);
-      setTargetRoom(r);
+    let active = true;
+    const clean = code.trim().toUpperCase();
+    if (clean.length >= 4) {
+      const r = roomEngine.getRoomByCode(clean);
+      if (r) {
+        setTargetRoom(r);
+      } else {
+        roomEngine.resolveRoomByCode(clean, 2500).then((netRoom) => {
+          if (active && netRoom) setTargetRoom(netRoom);
+        });
+      }
     } else {
       setTargetRoom(null);
     }
+    return () => {
+      active = false;
+    };
   }, [code]);
 
   // Listen for admin approval if waiting
@@ -74,34 +97,63 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleJoin = (e: React.FormEvent) => {
+  const handleJoin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
     setStatusMessage('');
 
-    if (!code.trim()) {
+    const cleanCode = code.trim().toUpperCase();
+    const cleanUsername = username.trim();
+
+    if (!cleanCode) {
       setError('Please enter the 6-character room code.');
       return;
     }
-    if (!username.trim()) {
+    if (!cleanUsername) {
       setError('Please enter a temporary name to participate.');
       return;
     }
 
-    const res = roomEngine.joinRoom({
-      roomCode: code.trim().toUpperCase(),
-      username: username.trim(),
-      password: password.trim() || undefined,
-    });
+    setIsSearching(true);
+    setStatusMessage('Connecting to room network...');
 
-    if (res.success && res.room && res.member) {
-      onJoinSuccess(res.room, res.member);
-      onClose();
-    } else if (res.status === 'pending_approval') {
-      setPendingApproval(true);
-      setStatusMessage('Join request sent to room owner. Waiting for approval...');
-    } else {
-      setError(res.error || 'Unable to enter room.');
+    try {
+      let r = roomEngine.getRoomByCode(cleanCode);
+      if (!r) {
+        r = await roomEngine.resolveRoomByCode(cleanCode, 3500);
+      }
+
+      if (!r) {
+        setIsSearching(false);
+        setStatusMessage('');
+        setError('Room not found. Please verify the code or check if the room was closed/expired.');
+        return;
+      }
+
+      setTargetRoom(r);
+
+      const res = roomEngine.joinRoom({
+        roomCode: cleanCode,
+        username: cleanUsername,
+        password: password.trim() || undefined,
+      });
+
+      setIsSearching(false);
+      setStatusMessage('');
+
+      if (res.success && res.room && res.member) {
+        onJoinSuccess(res.room, res.member);
+        onClose();
+      } else if (res.status === 'pending_approval') {
+        setPendingApproval(true);
+        setStatusMessage('Join request sent to room owner. Waiting for approval...');
+      } else {
+        setError(res.error || 'Unable to enter room.');
+      }
+    } catch {
+      setIsSearching(false);
+      setStatusMessage('');
+      setError('Error connecting to room. Please check your network connection.');
     }
   };
 
@@ -226,11 +278,20 @@ export const JoinRoomModal: React.FC<JoinRoomModalProps> = ({
             <button
               id="join-room-submit-btn"
               type="submit"
-              disabled={pendingApproval}
+              disabled={pendingApproval || isSearching}
               className="px-5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-zinc-950 font-semibold text-xs transition-colors flex items-center space-x-1.5 shadow-sm"
             >
-              <LogIn className="w-3.5 h-3.5" />
-              <span>Join Room</span>
+              {isSearching ? (
+                <>
+                  <Clock className="w-3.5 h-3.5 animate-spin" />
+                  <span>Connecting...</span>
+                </>
+              ) : (
+                <>
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>Join Room</span>
+                </>
+              )}
             </button>
           </div>
         </form>

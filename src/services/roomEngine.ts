@@ -1,11 +1,12 @@
 import { Room, RoomMember, Message, BanRecord, JoinRequest, RoomRole, RoomStatus, JoinMode } from '../types';
+import { networkRelay, RoomEventPayload } from './networkRelay';
 
 const STORAGE_KEY_ROOMS = 'chatroom_v1_rooms';
 const STORAGE_KEY_MEMBERS = 'chatroom_v1_members';
 const STORAGE_KEY_MESSAGES = 'chatroom_v1_messages';
 const STORAGE_KEY_BANS = 'chatroom_v1_bans';
 const STORAGE_KEY_REQUESTS = 'chatroom_v1_requests';
-const STORAGE_KEY_SESSIONS = 'chatroom_v1_current_session';
+const STORAGE_KEY_OPEN_TABS = 'chatroom_v1_open_tabs';
 
 // Avatar color palettes for temporary avatars
 const AVATAR_COLORS = [
@@ -90,7 +91,7 @@ class RoomEngine {
   private messages: Map<string, Message[]> = new Map(); // roomId -> messages
   private bans: Map<string, BanRecord[]> = new Map(); // roomId -> bans
   private requests: Map<string, JoinRequest[]> = new Map(); // roomId -> requests
-  private lastMessageTimes: Map<string, number> = new Map(); // sessionId -> timestamp
+  private lastMessageTimes: Map<string, number> = new Map(); // `${roomId}:${sessionId}` -> timestamp
 
   public subscribeToSyncEvents(listener: SyncListener) {
     return subscribeToSyncEvents(listener);
@@ -104,6 +105,279 @@ class RoomEngine {
     this.loadFromStorage();
     if (this.rooms.size === 0) {
       this.seedInitialDemoRoom();
+    }
+    this.initNetworkListeners();
+  }
+
+  private initNetworkListeners() {
+    // 1. Listen for new/updated rooms from the network
+    networkRelay.onRoomMeta((room) => {
+      if (room && room.id && room.room_code) {
+        const existing = this.rooms.get(room.id);
+        if (!existing || existing.created_at <= room.created_at) {
+          this.rooms.set(room.id, room);
+          this.saveToStorage();
+          broadcastEvent('ROOM_DISCOVERED', { room, roomId: room.id });
+        }
+      }
+    });
+
+    // 2. Listen for cross-device room events
+    networkRelay.onEvent((event: RoomEventPayload) => {
+      this.handleIncomingNetworkEvent(event);
+    });
+
+    // Auto-subscribe network relay to all known rooms
+    this.rooms.forEach((r) => {
+      networkRelay.subscribeToRoom(r.room_code);
+    });
+  }
+
+  private handleIncomingNetworkEvent(event: RoomEventPayload) {
+    const { type, roomId, roomCode, data } = event;
+    const room = this.rooms.get(roomId) || this.getRoomByCode(roomCode);
+    if (!room) return;
+
+    switch (type) {
+      case 'MEMBER_JOINED': {
+        const member = (data as { member: RoomMember }).member;
+        if (!member) return;
+        const members = this.members.get(room.id) || [];
+        const existingIdx = members.findIndex((m) => m.session_id === member.session_id);
+        if (existingIdx === -1) {
+          members.push(member);
+        } else {
+          members[existingIdx] = { ...members[existingIdx], ...member, is_online: true };
+        }
+        this.members.set(room.id, members);
+        this.saveToStorage();
+        broadcastEvent('MEMBER_JOINED', { member, roomId: room.id });
+        break;
+      }
+
+      case 'MEMBER_LEFT': {
+        const { sessionId } = data as { sessionId: string };
+        const members = this.members.get(room.id) || [];
+        const filtered = members.filter((m) => m.session_id !== sessionId);
+        this.members.set(room.id, filtered);
+        this.saveToStorage();
+        broadcastEvent('MEMBER_LEFT', { sessionId, roomId: room.id });
+        break;
+      }
+
+      case 'MESSAGE_SENT': {
+        const message = (data as { message: Message }).message;
+        if (!message) return;
+        const messages = this.messages.get(room.id) || [];
+        if (!messages.some((m) => m.id === message.id)) {
+          messages.push(message);
+          this.messages.set(room.id, messages);
+          this.saveToStorage();
+          broadcastEvent('MESSAGE_RECEIVED', { message, roomId: room.id });
+        }
+        break;
+      }
+
+      case 'MESSAGE_DELETED': {
+        const { messageId, deletedBy } = data as { messageId: string; deletedBy: string };
+        const messages = this.messages.get(room.id) || [];
+        const target = messages.find((m) => m.id === messageId);
+        if (target) {
+          target.deleted_at = Date.now();
+          target.deleted_by_name = deletedBy;
+          this.saveToStorage();
+          broadcastEvent('MESSAGE_DELETED', { messageId, roomId: room.id, deletedBy });
+        }
+        break;
+      }
+
+      case 'ROLE_CHANGED': {
+        const { targetSessionId, newRole } = data as { targetSessionId: string; newRole: RoomRole };
+        const members = this.members.get(room.id) || [];
+        const target = members.find((m) => m.session_id === targetSessionId);
+        if (target) {
+          target.role = newRole;
+          this.saveToStorage();
+          broadcastEvent('ROLE_UPDATED', { targetSessionId, newRole, roomId: room.id });
+        }
+        break;
+      }
+
+      case 'MEMBER_KICKED': {
+        const { targetSessionId } = data as { targetSessionId: string };
+        const members = this.members.get(room.id) || [];
+        const filtered = members.filter((m) => m.session_id !== targetSessionId);
+        this.members.set(room.id, filtered);
+        this.saveToStorage();
+        broadcastEvent('MEMBER_REMOVED', { targetSessionId, roomId: room.id });
+        break;
+      }
+
+      case 'MEMBER_BANNED': {
+        const { targetSessionId, username, reason } = data as { targetSessionId: string; username: string; reason?: string };
+        const members = this.members.get(room.id) || [];
+        const filtered = members.filter((m) => m.session_id !== targetSessionId);
+        this.members.set(room.id, filtered);
+
+        const bans = this.bans.get(room.id) || [];
+        if (!bans.some((b) => b.session_id === targetSessionId)) {
+          bans.push({
+            id: generateUUID(),
+            room_id: room.id,
+            session_id: targetSessionId,
+            username: username || 'Unknown',
+            reason: reason || 'Violating room rules',
+            banned_at: Date.now(),
+          });
+          this.bans.set(room.id, bans);
+        }
+        this.saveToStorage();
+        broadcastEvent('MEMBER_BANNED', { targetSessionId, roomId: room.id });
+        break;
+      }
+
+      case 'MEMBER_UNBANNED': {
+        const { unbannedUsername } = data as { unbannedUsername: string };
+        const bans = this.bans.get(room.id) || [];
+        const filtered = bans.filter((b) => b.username.toLowerCase() !== unbannedUsername.toLowerCase());
+        this.bans.set(room.id, filtered);
+        this.saveToStorage();
+        broadcastEvent('MEMBER_UNBANNED', { unbannedUsername, roomId: room.id });
+        break;
+      }
+
+      case 'ROOM_LOCKED':
+      case 'ROOM_UNLOCKED': {
+        const { status } = data as { status: RoomStatus };
+        room.status = status;
+        this.saveToStorage();
+        broadcastEvent('ROOM_LOCK_TOGGLED', { status, roomId: room.id });
+        break;
+      }
+
+      case 'ROOM_SETTINGS_UPDATED': {
+        const { slowModeSeconds } = data as { slowModeSeconds: number };
+        room.slow_mode_seconds = slowModeSeconds;
+        this.saveToStorage();
+        broadcastEvent('SETTINGS_CHANGED', { room, roomId: room.id });
+        break;
+      }
+
+      case 'ROOM_ENDED': {
+        room.status = 'ended';
+        this.saveToStorage();
+        broadcastEvent('ROOM_ENDED', { roomId: room.id });
+        break;
+      }
+
+      case 'JOIN_REQUESTED': {
+        const { request } = data as { request: JoinRequest };
+        if (request) {
+          const requests = this.requests.get(room.id) || [];
+          if (!requests.some((r) => r.id === request.id)) {
+            requests.push(request);
+            this.requests.set(room.id, requests);
+            this.saveToStorage();
+            broadcastEvent('JOIN_REQUEST_SUBMITTED', { request, roomId: room.id });
+          }
+        }
+        break;
+      }
+
+      case 'JOIN_REQUEST_DECIDED': {
+        const { requestId, status, member } = data as { requestId: string; status: 'accepted' | 'rejected'; member?: RoomMember };
+        const requests = this.requests.get(room.id) || [];
+        const targetReq = requests.find((r) => r.id === requestId);
+        if (targetReq) {
+          targetReq.status = status;
+        }
+        if (status === 'accepted' && member) {
+          const members = this.members.get(room.id) || [];
+          if (!members.some((m) => m.session_id === member.session_id)) {
+            members.push(member);
+            this.members.set(room.id, members);
+          }
+        }
+        this.saveToStorage();
+        broadcastEvent('JOIN_REQUEST_DECIDED', { requestId, status, roomId: room.id });
+        break;
+      }
+
+      case 'TYPING_STATUS': {
+        const { sessionId, username } = data as { sessionId: string; username: string };
+        broadcastEvent('TYPING_STATUS', { roomId: room.id, sessionId, username, timestamp: Date.now() });
+        break;
+      }
+
+      case 'SYNC_REQUEST': {
+        // If we have messages or members in this room, respond with current state
+        const currentMessages = this.messages.get(room.id) || [];
+        const currentMembers = this.members.get(room.id) || [];
+        const currentBans = this.bans.get(room.id) || [];
+        const currentRequests = this.requests.get(room.id) || [];
+
+        if (currentMessages.length > 0 || currentMembers.length > 0) {
+          networkRelay.publishEvent({
+            type: 'SYNC_RESPONSE',
+            roomId: room.id,
+            roomCode: room.room_code,
+            data: {
+              room,
+              messages: currentMessages,
+              members: currentMembers,
+              bans: currentBans,
+              requests: currentRequests,
+            },
+          });
+        }
+        break;
+      }
+
+      case 'SYNC_RESPONSE': {
+        const syncData = data as {
+          room?: Room;
+          messages?: Message[];
+          members?: RoomMember[];
+          bans?: BanRecord[];
+          requests?: JoinRequest[];
+        };
+
+        let changed = false;
+        if (syncData.messages && Array.isArray(syncData.messages)) {
+          const existing = this.messages.get(room.id) || [];
+          const existingIds = new Set(existing.map((m) => m.id));
+          const newOnes = syncData.messages.filter((m) => !existingIds.has(m.id));
+          if (newOnes.length > 0) {
+            this.messages.set(room.id, [...existing, ...newOnes].sort((a, b) => a.created_at - b.created_at));
+            changed = true;
+          }
+        }
+
+        if (syncData.members && Array.isArray(syncData.members)) {
+          const existing = this.members.get(room.id) || [];
+          const map = new Map<string, RoomMember>();
+          existing.forEach((m) => map.set(m.session_id, m));
+          syncData.members.forEach((m) => map.set(m.session_id, m));
+          this.members.set(room.id, Array.from(map.values()));
+          changed = true;
+        }
+
+        if (syncData.bans && Array.isArray(syncData.bans)) {
+          this.bans.set(room.id, syncData.bans);
+          changed = true;
+        }
+
+        if (syncData.requests && Array.isArray(syncData.requests)) {
+          this.requests.set(room.id, syncData.requests);
+          changed = true;
+        }
+
+        if (changed) {
+          this.saveToStorage();
+          broadcastEvent('ROOM_SYNCED', { roomId: room.id });
+        }
+        break;
+      }
     }
   }
 
@@ -305,6 +579,21 @@ class RoomEngine {
     return this.requests.get(roomId) || [];
   }
 
+  // Async room lookup combining local storage and live network discovery
+  public async resolveRoomByCode(code: string, timeoutMs = 3000): Promise<Room | null> {
+    const local = this.getRoomByCode(code);
+    if (local) return local;
+
+    const networkRoom = await networkRelay.fetchRoomMeta(code, timeoutMs);
+    if (networkRoom) {
+      this.rooms.set(networkRoom.id, networkRoom);
+      this.saveToStorage();
+      networkRelay.subscribeToRoom(networkRoom.room_code);
+      return networkRoom;
+    }
+    return null;
+  }
+
   // Check and update expirations
   public checkExpirations() {
     const now = Date.now();
@@ -390,6 +679,11 @@ class RoomEngine {
     this.requests.set(roomId, []);
 
     this.saveToStorage();
+
+    // Publish to network relay and subscribe
+    networkRelay.subscribeToRoom(roomCode);
+    networkRelay.publishRoomMeta(newRoom);
+
     broadcastEvent('ROOM_CREATED', { room: newRoom });
 
     return { room: newRoom, session: ownerMember };
@@ -446,6 +740,15 @@ class RoomEngine {
         existing.last_seen = Date.now();
         this.saveToStorage();
         broadcastEvent('MEMBER_JOINED', { member: existing, roomId: room.id });
+        networkRelay.subscribeToRoom(room.room_code);
+        networkRelay.publishEvent({
+          type: 'MEMBER_JOINED',
+          roomId: room.id,
+          roomCode: room.room_code,
+          senderSessionId: existing.session_id,
+          senderName: existing.username,
+          data: { member: existing },
+        });
         return { success: true, status: 'joined', member: existing, room };
       }
     }
@@ -482,6 +785,15 @@ class RoomEngine {
           requests.push(newReq);
           this.requests.set(room.id, requests);
           this.saveToStorage();
+          networkRelay.subscribeToRoom(room.room_code);
+          networkRelay.publishEvent({
+            type: 'JOIN_REQUESTED',
+            roomId: room.id,
+            roomCode: room.room_code,
+            senderSessionId: sessionId,
+            senderName: trimmedUsername,
+            data: { request: newReq },
+          });
           broadcastEvent('JOIN_REQUEST_SUBMITTED', { request: newReq, roomId: room.id });
         }
         return { success: false, status: 'pending_approval', error: 'Join request sent. Awaiting administrator approval...' };
@@ -520,6 +832,32 @@ class RoomEngine {
     this.messages.set(room.id, messages);
 
     this.saveToStorage();
+
+    // Subscribe to network updates & publish member join + sync request
+    networkRelay.subscribeToRoom(room.room_code);
+    networkRelay.publishEvent({
+      type: 'MEMBER_JOINED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: sessionId,
+      senderName: trimmedUsername,
+      data: { member: newMember },
+    });
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: 'system',
+      data: { message: sysMsg },
+    });
+    networkRelay.publishEvent({
+      type: 'SYNC_REQUEST',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: sessionId,
+      data: {},
+    });
+
     broadcastEvent('MEMBER_JOINED', { member: newMember, roomId: room.id });
     broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
 
@@ -559,10 +897,11 @@ class RoomEngine {
       return { success: false, error: 'This room is locked by an administrator. Only moderators can send messages.' };
     }
 
-    // Enforce slow mode for non-admin members
+    // Enforce slow mode for non-admin members (tracked per room & session)
+    const rateLimitKey = `${params.roomId}:${sender.session_id}`;
     const now = Date.now();
     if (room.slow_mode_seconds > 0 && sender.role === 'member') {
-      const lastTime = this.lastMessageTimes.get(sender.session_id) || 0;
+      const lastTime = this.lastMessageTimes.get(rateLimitKey) || 0;
       const elapsedSeconds = (now - lastTime) / 1000;
       if (elapsedSeconds < room.slow_mode_seconds) {
         const remaining = Math.ceil(room.slow_mode_seconds - elapsedSeconds);
@@ -570,8 +909,8 @@ class RoomEngine {
       }
     }
 
-    // Enforce general anti-spam rate limiting (10 msg / 5 sec)
-    const lastTime = this.lastMessageTimes.get(sender.session_id) || 0;
+    // Enforce general anti-spam rate limiting (tracked per room & session)
+    const lastTime = this.lastMessageTimes.get(rateLimitKey) || 0;
     if (now - lastTime < 300) {
       return { success: false, error: 'Sending too fast. Please slow down.' };
     }
@@ -591,13 +930,24 @@ class RoomEngine {
       created_at: now,
     };
 
-    this.lastMessageTimes.set(sender.session_id, now);
+    this.lastMessageTimes.set(rateLimitKey, now);
     const messages = this.messages.get(room.id) || [];
     messages.push(newMessage);
     this.messages.set(room.id, messages);
 
     sender.last_seen = now;
     this.saveToStorage();
+
+    // Broadcast across network relay to all other devices in the room
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: sender.session_id,
+      senderName: sender.username,
+      data: { message: newMessage },
+    });
+
     broadcastEvent('MESSAGE_RECEIVED', { message: newMessage, roomId: room.id });
 
     return { success: true, message: newMessage };
@@ -632,6 +982,16 @@ class RoomEngine {
     targetMsg.deleted_by_name = actor.username;
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'MESSAGE_DELETED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      senderName: actor.username,
+      data: { messageId: targetMsg.id, deletedBy: actor.username },
+    });
+
     broadcastEvent('MESSAGE_DELETED', { messageId: targetMsg.id, roomId: room.id, deletedBy: actor.username });
     return { success: true };
   }
@@ -679,6 +1039,22 @@ class RoomEngine {
     messages.push(sysMsg);
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'MEMBER_KICKED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: { targetSessionId: target.session_id },
+    });
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: 'system',
+      data: { message: sysMsg },
+    });
+
     broadcastEvent('MEMBER_REMOVED', { targetSessionId: target.session_id, roomId: room.id });
     broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
 
@@ -742,6 +1118,22 @@ class RoomEngine {
     messages.push(sysMsg);
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'MEMBER_BANNED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: { targetSessionId: target.session_id, username: target.username, reason: params.reason },
+    });
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: 'system',
+      data: { message: sysMsg },
+    });
+
     broadcastEvent('MEMBER_BANNED', { targetSessionId: target.session_id, roomId: room.id });
     broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
 
@@ -771,6 +1163,15 @@ class RoomEngine {
     this.bans.set(room.id, bans);
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'MEMBER_UNBANNED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: { unbannedUsername: unbanned.username },
+    });
+
     broadcastEvent('MEMBER_UNBANNED', { unbannedUsername: unbanned.username, roomId: room.id });
     return { success: true };
   }
@@ -811,6 +1212,22 @@ class RoomEngine {
     messages.push(sysMsg);
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'ROLE_CHANGED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: { targetSessionId: target.session_id, newRole: params.newRole },
+    });
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: 'system',
+      data: { message: sysMsg },
+    });
+
     broadcastEvent('ROLE_UPDATED', { targetSessionId: target.session_id, newRole: params.newRole, roomId: room.id });
     broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
 
@@ -848,6 +1265,22 @@ class RoomEngine {
     messages.push(sysMsg);
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: room.status === 'locked' ? 'ROOM_LOCKED' : 'ROOM_UNLOCKED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: { status: room.status },
+    });
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: 'system',
+      data: { message: sysMsg },
+    });
+
     broadcastEvent('ROOM_LOCK_TOGGLED', { status: room.status, roomId: room.id });
     broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
 
@@ -889,6 +1322,22 @@ class RoomEngine {
     messages.push(sysMsg);
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'ROOM_SETTINGS_UPDATED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: { slowModeSeconds: params.slowModeSeconds },
+    });
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: 'system',
+      data: { message: sysMsg },
+    });
+
     broadcastEvent('SETTINGS_CHANGED', { room, roomId: room.id });
     broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
 
@@ -916,12 +1365,13 @@ class RoomEngine {
     if (!req) return { success: false, error: 'Request not found' };
 
     req.status = params.approved ? 'accepted' : 'rejected';
+    let newMember: RoomMember | undefined;
 
     if (params.approved) {
       // Add member if not already in
       const existing = members.find((m) => m.session_id === req.session_id);
       if (!existing) {
-        const newMember: RoomMember = {
+        newMember = {
           session_id: req.session_id,
           room_id: room.id,
           username: req.username,
@@ -947,11 +1397,29 @@ class RoomEngine {
         };
         const messages = this.messages.get(room.id) || [];
         messages.push(sysMsg);
+
+        networkRelay.publishEvent({
+          type: 'MESSAGE_SENT',
+          roomId: room.id,
+          roomCode: room.room_code,
+          senderSessionId: 'system',
+          data: { message: sysMsg },
+        });
+
         broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
       }
     }
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'JOIN_REQUEST_DECIDED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: { requestId: req.id, status: req.status, member: newMember },
+    });
+
     broadcastEvent('JOIN_REQUEST_DECIDED', { requestId: req.id, status: req.status, roomId: room.id });
     return { success: true };
   }
@@ -987,6 +1455,22 @@ class RoomEngine {
     messages.push(sysMsg);
 
     this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'ROOM_ENDED',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: actor.session_id,
+      data: {},
+    });
+    networkRelay.publishEvent({
+      type: 'MESSAGE_SENT',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: 'system',
+      data: { message: sysMsg },
+    });
+
     broadcastEvent('ROOM_ENDED', { roomId: room.id });
     broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId: room.id });
 
@@ -995,11 +1479,22 @@ class RoomEngine {
 
   // Broadcast typing indicator
   public emitTyping(roomId: string, sessionId: string, username: string) {
+    const room = this.rooms.get(roomId);
+    if (room) {
+      networkRelay.publishEvent({
+        type: 'TYPING_STATUS',
+        roomId,
+        roomCode: room.room_code,
+        senderSessionId: sessionId,
+        data: { sessionId, username },
+      });
+    }
     broadcastEvent('TYPING_STATUS', { roomId, sessionId, username, timestamp: Date.now() });
   }
 
   // Leave room
   public leaveRoom(roomId: string, sessionId: string) {
+    const room = this.rooms.get(roomId);
     const members = this.members.get(roomId) || [];
     const idx = members.findIndex((m) => m.session_id === sessionId);
     if (idx !== -1) {
@@ -1022,6 +1517,24 @@ class RoomEngine {
       messages.push(sysMsg);
 
       this.saveToStorage();
+
+      if (room) {
+        networkRelay.publishEvent({
+          type: 'MEMBER_LEFT',
+          roomId,
+          roomCode: room.room_code,
+          senderSessionId: sessionId,
+          data: { sessionId },
+        });
+        networkRelay.publishEvent({
+          type: 'MESSAGE_SENT',
+          roomId,
+          roomCode: room.room_code,
+          senderSessionId: 'system',
+          data: { message: sysMsg },
+        });
+      }
+
       broadcastEvent('MEMBER_LEFT', { sessionId, roomId });
       broadcastEvent('MESSAGE_RECEIVED', { message: sysMsg, roomId });
     }
@@ -1034,7 +1547,7 @@ class RoomEngine {
     localStorage.removeItem(STORAGE_KEY_MESSAGES);
     localStorage.removeItem(STORAGE_KEY_BANS);
     localStorage.removeItem(STORAGE_KEY_REQUESTS);
-    localStorage.removeItem(STORAGE_KEY_SESSIONS);
+    localStorage.removeItem(STORAGE_KEY_OPEN_TABS);
     this.rooms.clear();
     this.members.clear();
     this.messages.clear();
