@@ -1,0 +1,6 @@
+{
+  "name": "ChatRoom",
+  "description": "Temporary, privacy-first communication platform with zero accounts, disposable identities, admin moderation, and room expiration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
