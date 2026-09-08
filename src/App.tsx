@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Navbar } from './components/Navbar';
 import { HomeView } from './components/HomeView';
 import { CreateRoomModal } from './components/CreateRoomModal';
@@ -70,40 +70,37 @@ export default function App() {
     }
   }, [openRooms]);
 
+  const activeRoomRef = useRef(activeRoom);
+  activeRoomRef.current = activeRoom;
+  const activeRoomIdRef = useRef(activeRoomId);
+  activeRoomIdRef.current = activeRoomId;
+  const currentMemberRef = useRef(currentMember);
+  currentMemberRef.current = currentMember;
+
   // Refresh active room data
   const refreshRoomData = useCallback(() => {
-    if (!activeRoom) return;
-    const r = roomEngine.getRoomById(activeRoom.id);
+    const curRoom = activeRoomRef.current;
+    if (!curRoom) return;
+    const r = roomEngine.getRoomById(curRoom.id);
     if (r) {
-      // Update room in openRooms if changed
-      setOpenRooms((prev) =>
-        prev.map((item) => (item.room.id === r.id ? { ...item, room: { ...r } } : item))
-      );
       setMessages([...roomEngine.getMessages(r.id)]);
       const currentM = roomEngine.getMembers(r.id);
       setMembers([...currentM]);
       setBans([...roomEngine.getBans(r.id)]);
       setRequests([...roomEngine.getJoinRequests(r.id)]);
 
-      // If currentMember was kicked or banned
-      if (currentMember) {
-        const updatedSelf = currentM.find((m) => m.session_id === currentMember.session_id);
-        const isBanned = roomEngine.getBans(r.id).some((b) => b.session_id === currentMember.session_id);
-        if (!updatedSelf || isBanned) {
+      const curMem = currentMemberRef.current;
+      if (curMem) {
+        const isBanned = roomEngine.getBans(r.id).some((b) => b.session_id === curMem.session_id);
+        const updatedSelf = currentM.find((m) => m.session_id === curMem.session_id);
+        if (isBanned || (!updatedSelf && !currentM.some((m) => m.username.toLowerCase() === curMem.username.toLowerCase()))) {
           alert('You have been removed or banned from this room.');
           setOpenRooms((prev) => prev.filter((item) => item.room.id !== r.id));
           setActiveRoomId((prevId) => (prevId === r.id ? null : prevId));
-        } else {
-          // Update member session
-          setOpenRooms((prev) =>
-            prev.map((item) =>
-              item.room.id === r.id ? { ...item, session: { ...updatedSelf } } : item
-            )
-          );
         }
       }
     }
-  }, [activeRoom, currentMember]);
+  }, []);
 
   // Load all rooms for home listing
   const refreshAllRooms = useCallback(() => {
@@ -144,13 +141,14 @@ export default function App() {
     refreshAllRooms();
     const unsubscribe = roomEngine.subscribeToSyncEvents?.((event) => {
       const eventRoomId = (event.payload as { roomId?: string })?.roomId;
+      const curActiveId = activeRoomIdRef.current;
 
       if (eventRoomId) {
         // Increment unread count for background open rooms
         if (event.type === 'MESSAGE_RECEIVED') {
           setOpenRooms((prev) =>
             prev.map((s) => {
-              if (s.room.id === eventRoomId && s.room.id !== activeRoomId) {
+              if (s.room.id === eventRoomId && s.room.id !== curActiveId) {
                 return { ...s, unreadCount: s.unreadCount + 1 };
               }
               return s;
@@ -159,7 +157,7 @@ export default function App() {
         }
 
         // If affects currently visible room, refresh data
-        if (eventRoomId === activeRoomId) {
+        if (eventRoomId === curActiveId) {
           refreshRoomData();
         }
       }
@@ -170,7 +168,7 @@ export default function App() {
     return () => {
       if (unsubscribe) unsubscribe();
     };
-  }, [activeRoomId, refreshRoomData, refreshAllRooms]);
+  }, [refreshRoomData, refreshAllRooms]);
 
   // Detect URL parameter on initial mount e.g. ?r=X7K9PQ
   useEffect(() => {

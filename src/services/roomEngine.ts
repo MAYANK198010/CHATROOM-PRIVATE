@@ -113,10 +113,18 @@ class RoomEngine {
       const now = Date.now();
       this.rooms.forEach((r) => {
         if (r.status === 'active' && now < r.expires_at) {
-          networkRelay.publishRoomMeta(r);
+          const members = this.members.get(r.id) || [];
+          const owner = members.find((m) => m.role === 'owner') || members[0];
+          networkRelay.publishRoomMeta(r, owner);
         }
       });
-    }, 6000);
+    }, 15000);
+
+    // Watchdog for room expirations and presence timeouts
+    setInterval(() => {
+      this.checkExpirations();
+      this.checkPresenceTimeouts();
+    }, 4000);
   }
 
   private initNetworkListeners() {
@@ -178,23 +186,73 @@ class RoomEngine {
       case 'MEMBER_LEFT': {
         const { sessionId } = data as { sessionId: string };
         const members = this.members.get(room.id) || [];
-        const filtered = members.filter((m) => m.session_id !== sessionId);
-        this.members.set(room.id, filtered);
-        this.saveToStorage();
-        broadcastEvent('MEMBER_LEFT', { sessionId, roomId: room.id });
+        const target = members.find((m) => m.session_id === sessionId);
+        if (target) {
+          target.is_online = false;
+          target.last_seen = Date.now();
+          this.saveToStorage();
+          broadcastEvent('PRESENCE_UPDATED', { sessionId, roomId: room.id });
+          broadcastEvent('MEMBER_LEFT', { sessionId, roomId: room.id });
+        }
         break;
       }
 
       case 'MESSAGE_SENT': {
-        const message = (data as { message: Message }).message;
+        const message = (data as { message: Message; sender?: RoomMember }).message;
+        const senderProfile = (data as { message: Message; sender?: RoomMember }).sender;
         if (!message) return;
         const messages = this.messages.get(room.id) || [];
         if (!messages.some((m) => m.id === message.id)) {
           messages.push(message);
           this.messages.set(room.id, messages);
-          this.saveToStorage();
-          broadcastEvent('MESSAGE_RECEIVED', { message, roomId: room.id });
         }
+
+        // Keep sender member profile updated and online
+        const members = this.members.get(room.id) || [];
+        const existingIdx = members.findIndex((m) => m.session_id === message.session_id);
+        if (existingIdx !== -1) {
+          members[existingIdx].last_seen = Date.now();
+          members[existingIdx].is_online = true;
+        } else if (message.session_id && message.session_id !== 'system') {
+          members.push(
+            senderProfile || {
+              session_id: message.session_id,
+              room_id: room.id,
+              username: message.sender_name,
+              role: message.sender_role || 'member',
+              joined_at: message.created_at || Date.now(),
+              last_seen: Date.now(),
+              is_online: true,
+              color: getDeterministicColor(message.sender_name),
+            }
+          );
+        }
+        this.members.set(room.id, members);
+        this.saveToStorage();
+        broadcastEvent('MESSAGE_RECEIVED', { message, roomId: room.id });
+        broadcastEvent('PRESENCE_UPDATED', { roomId: room.id });
+        break;
+      }
+
+      case 'PRESENCE_PING':
+      case 'PRESENCE_PONG': {
+        const pingMember = (data as { member?: RoomMember }).member;
+        if (!pingMember || !pingMember.session_id) return;
+        const members = this.members.get(room.id) || [];
+        const existingIdx = members.findIndex((m) => m.session_id === pingMember.session_id);
+        if (existingIdx === -1) {
+          members.push({ ...pingMember, is_online: true, last_seen: Date.now() });
+        } else {
+          members[existingIdx] = {
+            ...members[existingIdx],
+            ...pingMember,
+            is_online: true,
+            last_seen: Date.now(),
+          };
+        }
+        this.members.set(room.id, members);
+        this.saveToStorage();
+        broadcastEvent('PRESENCE_UPDATED', { member: pingMember, roomId: room.id });
         break;
       }
 
@@ -602,18 +660,98 @@ class RoomEngine {
   }
 
   // Async room lookup combining local storage and live network discovery
-  public async resolveRoomByCode(code: string, timeoutMs = 3000): Promise<Room | null> {
-    const local = this.getRoomByCode(code);
-    if (local) return local;
+  public async resolveRoomByCode(code: string, timeoutMs = 4000): Promise<Room | null> {
+    const cleanCode = code.trim().toUpperCase();
+    const local = this.getRoomByCode(cleanCode);
+    if (local) {
+      networkRelay.subscribeToRoom(local.room_code);
+      return local;
+    }
 
-    const networkRoom = await networkRelay.fetchRoomMeta(code, timeoutMs);
-    if (networkRoom) {
-      this.rooms.set(networkRoom.id, networkRoom);
+    const discovery = await networkRelay.fetchRoomMeta(cleanCode, timeoutMs);
+    if (discovery && discovery.room) {
+      const netRoom = discovery.room;
+      this.rooms.set(netRoom.id, netRoom);
+
+      // Restore cached messages if available
+      if (discovery.cachedMessages && discovery.cachedMessages.length > 0) {
+        const existingMessages = this.messages.get(netRoom.id) || [];
+        const existingIds = new Set(existingMessages.map((m) => m.id));
+        const newOnes = discovery.cachedMessages.filter((m) => !existingIds.has(m.id));
+        this.messages.set(netRoom.id, [...existingMessages, ...newOnes].sort((a, b) => a.created_at - b.created_at));
+      }
+
+      // Restore cached members if available
+      if (discovery.cachedMembers && discovery.cachedMembers.length > 0) {
+        const existingMembers = this.members.get(netRoom.id) || [];
+        const map = new Map<string, RoomMember>();
+        existingMembers.forEach((m) => map.set(m.session_id, m));
+        discovery.cachedMembers.forEach((m) => map.set(m.session_id, m));
+        this.members.set(netRoom.id, Array.from(map.values()));
+      }
+
       this.saveToStorage();
-      networkRelay.subscribeToRoom(networkRoom.room_code);
-      return networkRoom;
+      networkRelay.subscribeToRoom(netRoom.room_code);
+      broadcastEvent('ROOM_DISCOVERED', { room: netRoom, roomId: netRoom.id });
+      return netRoom;
     }
     return null;
+  }
+
+  // Watchdog for presence timeouts (marks inactive users offline)
+  public checkPresenceTimeouts() {
+    const now = Date.now();
+    let updated = false;
+    this.members.forEach((membersList) => {
+      membersList.forEach((m) => {
+        if (m.is_online && now - m.last_seen > 35000) {
+          m.is_online = false;
+          updated = true;
+        }
+      });
+    });
+    if (updated) {
+      this.saveToStorage();
+      broadcastEvent('PRESENCE_UPDATED', {});
+    }
+  }
+
+  // Heartbeat ping to keep member presence active across devices
+  public sendPresencePing(roomId: string, member: RoomMember) {
+    const room = this.getRoomById(roomId);
+    if (!room) return;
+
+    const members = this.members.get(room.id) || [];
+    const existing = members.find((m) => m.session_id === member.session_id);
+    const now = Date.now();
+    if (existing) {
+      existing.last_seen = now;
+      existing.is_online = true;
+    } else {
+      members.push({ ...member, last_seen: now, is_online: true });
+      this.members.set(room.id, members);
+    }
+    this.saveToStorage();
+
+    networkRelay.publishEvent({
+      type: 'PRESENCE_PING',
+      roomId: room.id,
+      roomCode: room.room_code,
+      senderSessionId: member.session_id,
+      senderName: member.username,
+      data: {
+        member: {
+          session_id: member.session_id,
+          room_id: room.id,
+          username: member.username,
+          role: member.role,
+          joined_at: member.joined_at,
+          last_seen: now,
+          is_online: true,
+          color: member.color,
+        },
+      },
+    });
   }
 
   // Check and update expirations
@@ -704,7 +842,7 @@ class RoomEngine {
 
     // Publish to network relay and subscribe
     networkRelay.subscribeToRoom(roomCode);
-    networkRelay.publishRoomMeta(newRoom);
+    networkRelay.publishRoomMeta(newRoom, ownerMember);
 
     broadcastEvent('ROOM_CREATED', { room: newRoom });
 
@@ -967,7 +1105,7 @@ class RoomEngine {
       roomCode: room.room_code,
       senderSessionId: sender.session_id,
       senderName: sender.username,
-      data: { message: newMessage },
+      data: { message: newMessage, sender },
     });
 
     broadcastEvent('MESSAGE_RECEIVED', { message: newMessage, roomId: room.id });

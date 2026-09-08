@@ -107,6 +107,19 @@ export const ChatRoomView: React.FC<ChatRoomViewProps> = ({
     };
   }, [room.id, currentMember.session_id]);
 
+  // Real-time presence heartbeat to keep user online and discover other devices
+  useEffect(() => {
+    roomEngine.sendPresencePing(room.id, currentMember);
+
+    const interval = setInterval(() => {
+      roomEngine.sendPresencePing(room.id, currentMember);
+    }, 6000);
+
+    return () => {
+      clearInterval(interval);
+    };
+  }, [room.id, currentMember]);
+
   // Slow mode cooldown timer
   useEffect(() => {
     if (slowModeCooldown <= 0) return;
@@ -184,7 +197,15 @@ export const ChatRoomView: React.FC<ChatRoomViewProps> = ({
     return new Date(timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
-  const activeMembersCount = useMemo(() => members.length, [members]);
+  const onlineMembers = useMemo(() => {
+    const now = Date.now();
+    return members.filter((m) => {
+      if (m.session_id === currentMember.session_id) return true;
+      return Boolean(m.is_online && now - m.last_seen < 35000);
+    });
+  }, [members, currentMember.session_id]);
+
+  const activeMembersCount = onlineMembers.length || 1;
 
   return (
     <div className="h-[calc(100vh-60px)] flex flex-col bg-zinc-950 text-white select-text">
@@ -234,6 +255,12 @@ export const ChatRoomView: React.FC<ChatRoomViewProps> = ({
                 </span>
               )}
               {isExpired && <span className="text-rose-400">Closed</span>}
+
+              {/* Live Active Count */}
+              <span>•</span>
+              <span className="text-emerald-400 font-medium">
+                {activeMembersCount} {activeMembersCount === 1 ? 'user online' : 'users online'}
+              </span>
 
               {/* Slow mode badge */}
               {room.slow_mode_seconds > 0 && (

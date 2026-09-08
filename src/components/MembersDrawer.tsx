@@ -20,6 +20,22 @@ export const MembersDrawer: React.FC<MembersDrawerProps> = ({
   if (!isOpen) return null;
 
   const isPrivileged = currentMember.role === 'owner' || currentMember.role === 'moderator';
+  const now = Date.now();
+
+  const isMemberOnline = (m: RoomMember) => {
+    if (m.session_id === currentMember.session_id) return true;
+    return Boolean(m.is_online && now - m.last_seen < 35000);
+  };
+
+  const sortedMembers = [...members].sort((a, b) => {
+    const aOnline = isMemberOnline(a);
+    const bOnline = isMemberOnline(b);
+    if (aOnline && !bOnline) return -1;
+    if (!aOnline && bOnline) return 1;
+    return b.joined_at - a.joined_at;
+  });
+
+  const onlineCount = sortedMembers.filter(isMemberOnline).length;
 
   return (
     <div className="fixed inset-0 z-40 flex justify-end bg-black/50 backdrop-blur-xs animate-in fade-in duration-100">
@@ -29,8 +45,8 @@ export const MembersDrawer: React.FC<MembersDrawerProps> = ({
           <div className="flex items-center space-x-2">
             <Users className="w-4 h-4 text-emerald-400" />
             <h3 className="text-sm font-semibold text-white">Room Members</h3>
-            <span className="text-xs font-mono px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300">
-              {members.length}
+            <span className="text-xs font-mono px-2 py-0.5 rounded-full bg-emerald-950/80 text-emerald-400 border border-emerald-800/60 font-semibold">
+              {onlineCount} active
             </span>
           </div>
           <button
@@ -43,13 +59,15 @@ export const MembersDrawer: React.FC<MembersDrawerProps> = ({
 
         {/* Member List */}
         <div className="p-4 flex-1 overflow-y-auto space-y-2">
-          <div className="text-[11px] font-mono uppercase tracking-wider text-zinc-400 pb-1">
-            Active in Room
+          <div className="flex items-center justify-between text-[11px] font-mono uppercase tracking-wider text-zinc-400 pb-1">
+            <span>Participants ({members.length})</span>
+            <span className="text-emerald-400">{onlineCount} connected</span>
           </div>
 
           <div className="space-y-1.5">
-            {members.map((m) => {
+            {sortedMembers.map((m) => {
               const isSelf = m.session_id === currentMember.session_id;
+              const online = isMemberOnline(m);
 
               return (
                 <div
@@ -61,7 +79,12 @@ export const MembersDrawer: React.FC<MembersDrawerProps> = ({
                       <div className={`w-8 h-8 rounded-full ${m.color} text-white text-xs font-bold flex items-center justify-center`}>
                         {m.username.charAt(0).toUpperCase()}
                       </div>
-                      <div className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full bg-emerald-500 border-2 border-zinc-900" />
+                      <div
+                        className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full border-2 border-zinc-900 ${
+                          online ? 'bg-emerald-500' : 'bg-zinc-600'
+                        }`}
+                        title={online ? 'Online' : 'Offline'}
+                      />
                     </div>
 
                     <div className="truncate">
@@ -70,6 +93,11 @@ export const MembersDrawer: React.FC<MembersDrawerProps> = ({
                         {isSelf && (
                           <span className="text-[9px] px-1 rounded bg-zinc-800 text-zinc-400 font-mono">
                             You
+                          </span>
+                        )}
+                        {!online && (
+                          <span className="text-[9px] px-1 rounded bg-zinc-900 text-zinc-500 font-mono">
+                            offline
                           </span>
                         )}
                       </div>

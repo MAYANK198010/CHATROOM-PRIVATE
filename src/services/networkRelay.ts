@@ -4,7 +4,7 @@
  */
 
 import mqtt, { MqttClient } from 'mqtt';
-import { Room } from '../types';
+import { Room, Message, RoomMember } from '../types';
 
 export interface RoomEventPayload {
   type:
@@ -26,25 +26,88 @@ export interface RoomEventPayload {
     | 'SYNC_REQUEST'
     | 'SYNC_RESPONSE'
     | 'ROOM_ANNOUNCE'
-    | 'DISCOVER_PING';
+    | 'DISCOVER_PING'
+    | 'PRESENCE_PING'
+    | 'PRESENCE_PONG';
   roomId: string;
   roomCode: string;
   senderSessionId: string;
   senderName?: string;
   timestamp: number;
+  publisherClientId?: string;
   data: unknown;
 }
 
 export type NetworkEventListener = (event: RoomEventPayload) => void;
 export type RoomMetaListener = (room: Room) => void;
 
-// Dual Reliable Transports:
-// 1. HTTP/WSS Port 443: ntfy.sh (Unrestricted on 5G/LTE and mobile carriers)
-// 2. MQTT Broker: broker.emqx.io:8084 (Fast low-latency real-time relay)
+export interface RoomDiscoveryResult {
+  room: Room;
+  cachedMessages: Message[];
+  cachedMembers: RoomMember[];
+}
+
 const NTFY_BASE_URL = 'https://ntfy.sh';
 const NTFY_WS_BASE_URL = 'wss://ntfy.sh';
 const EMQX_BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
 const TOPIC_PREFIX = 'ephemeral_chatroom_v3';
+
+/**
+ * Safely parse NDJSON and concatenated JSON objects from raw response text.
+ * Handles missing newlines between objects (}{), line breaks inside strings,
+ * and malformed stream chunks.
+ */
+function parseNtfyJsonStream(rawText: string): Array<{ event?: string; message?: string; [key: string]: unknown }> {
+  const results: Array<{ event?: string; message?: string; [key: string]: unknown }> = [];
+  if (!rawText || !rawText.trim()) return results;
+
+  let depth = 0;
+  let inString = false;
+  let escapeNext = false;
+  let start = -1;
+
+  for (let i = 0; i < rawText.length; i++) {
+    const char = rawText[i];
+
+    if (escapeNext) {
+      escapeNext = false;
+      continue;
+    }
+
+    if (char === '\\' && inString) {
+      escapeNext = true;
+      continue;
+    }
+
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (!inString) {
+      if (char === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (char === '}') {
+        depth--;
+        if (depth === 0 && start !== -1) {
+          const jsonStr = rawText.slice(start, i + 1);
+          try {
+            const parsed = JSON.parse(jsonStr);
+            if (parsed && typeof parsed === 'object') {
+              results.push(parsed);
+            }
+          } catch {
+            // Ignore individual malformed segment
+          }
+          start = -1;
+        }
+      }
+    }
+  }
+
+  return results;
+}
 
 class NetworkRelay {
   private clientId: string;
@@ -53,6 +116,8 @@ class NetworkRelay {
 
   // Active room WebSockets (ntfy.sh over port 443)
   private activeRoomSockets: Map<string, WebSocket> = new Map();
+  // Active HTTP pollers for continuous background sync on all networks
+  private activeRoomPollers: Map<string, ReturnType<typeof setInterval>> = new Map();
   private subscribedRoomCodes: Set<string> = new Set();
 
   private eventListeners: Set<NetworkEventListener> = new Set();
@@ -72,25 +137,24 @@ class NetworkRelay {
     // Re-check announcements and flush outbox periodically
     setInterval(() => {
       this.flushOutbox();
-    }, 2000);
+    }, 2500);
   }
 
   // ---------------------------------------------------------------------------
-  // 1. MQTT Initialization (EMQX)
+  // 1. MQTT Initialization (EMQX fallback)
   // ---------------------------------------------------------------------------
   private initMqtt() {
     try {
       this.mqttClient = mqtt.connect(EMQX_BROKER_URL, {
         clientId: this.clientId,
         clean: true,
-        connectTimeout: 4000,
-        reconnectPeriod: 3000,
+        connectTimeout: 5000,
+        reconnectPeriod: 4000,
         keepalive: 30,
       });
 
       this.mqttClient.on('connect', () => {
         this.isMqttConnected = true;
-        // Re-subscribe to all active room topics
         this.subscribedRoomCodes.forEach((code) => {
           this.subscribeMqttRoom(code);
         });
@@ -106,36 +170,45 @@ class NetworkRelay {
         }
       });
 
-      this.mqttClient.on('error', (err) => {
-        console.warn('MQTT connection note:', err.message);
+      this.mqttClient.on('error', () => {
+        // Warning suppressed for clean console
       });
 
       this.mqttClient.on('offline', () => {
         this.isMqttConnected = false;
       });
-    } catch (e) {
-      console.warn('MQTT init failed, falling back purely to HTTPS/WSS 443:', e);
+    } catch {
+      // Fall back purely to HTTPS/WSS 443
     }
   }
 
   private subscribeMqttRoom(cleanCode: string) {
     if (this.mqttClient && this.isMqttConnected) {
-      this.mqttClient.subscribe(`${TOPIC_PREFIX}_${cleanCode}`, { qos: 0 });
+      try {
+        this.mqttClient.subscribe(`${TOPIC_PREFIX}_${cleanCode}`, { qos: 0 });
+      } catch {
+        // Ignore
+      }
     }
   }
 
   // ---------------------------------------------------------------------------
-  // 2. Port 443 HTTPS / WebSocket Connection (ntfy.sh)
+  // 2. Port 443 WebSocket Connection (ntfy.sh)
   // ---------------------------------------------------------------------------
   private subscribePort443Room(cleanCode: string) {
-    if (this.activeRoomSockets.has(cleanCode)) {
-      const existing = this.activeRoomSockets.get(cleanCode);
-      if (existing && existing.readyState === WebSocket.OPEN) return;
+    const existing = this.activeRoomSockets.get(cleanCode);
+    if (existing && (existing.readyState === WebSocket.OPEN || existing.readyState === WebSocket.CONNECTING)) {
+      return;
     }
 
     try {
       const topic = `${TOPIC_PREFIX}_${cleanCode}`;
       const ws = new WebSocket(`${NTFY_WS_BASE_URL}/${topic}/ws`);
+
+      ws.onopen = () => {
+        // Poll immediately to catch any messages published while disconnected
+        this.pollRoomMessages(cleanCode);
+      };
 
       ws.onmessage = (e) => {
         try {
@@ -151,7 +224,7 @@ class NetworkRelay {
 
       ws.onclose = () => {
         this.activeRoomSockets.delete(cleanCode);
-        // Auto-reconnect if room is still subscribed
+        // Auto-reconnect if room is still active
         if (this.subscribedRoomCodes.has(cleanCode)) {
           setTimeout(() => this.subscribePort443Room(cleanCode), 3000);
         }
@@ -166,43 +239,107 @@ class NetworkRelay {
       };
 
       this.activeRoomSockets.set(cleanCode, ws);
-    } catch (err) {
-      console.warn('Port 443 WebSocket error:', err);
+    } catch {
+      // Handled by active HTTP polling
     }
   }
 
   // ---------------------------------------------------------------------------
-  // 3. Incoming Event Dispatcher & Deduplicator
+  // 3. Continuous Active HTTP Sync Poller (Universal mobile 5G/LTE reliability)
+  // ---------------------------------------------------------------------------
+  private startActivePoller(cleanCode: string) {
+    if (this.activeRoomPollers.has(cleanCode)) return;
+
+    // Run first sync immediately
+    this.pollRoomMessages(cleanCode);
+
+    // Continuous ticker every 2.5 seconds
+    const interval = setInterval(() => {
+      this.pollRoomMessages(cleanCode);
+    }, 2500);
+
+    this.activeRoomPollers.set(cleanCode, interval);
+  }
+
+  private stopActivePoller(cleanCode: string) {
+    const poller = this.activeRoomPollers.get(cleanCode);
+    if (poller) {
+      clearInterval(poller);
+      this.activeRoomPollers.delete(cleanCode);
+    }
+  }
+
+  public async pollRoomMessages(cleanCode: string): Promise<void> {
+    const topic = `${TOPIC_PREFIX}_${cleanCode}`;
+    try {
+      // Query cached events from the last 12 hours (maximum free tier retention)
+      const pollUrl = `${NTFY_BASE_URL}/${topic}/json?poll=1&since=12h`;
+      const res = await fetch(pollUrl, { method: 'GET' });
+      if (!res.ok) return;
+
+      const rawText = await res.text();
+      const events = parseNtfyJsonStream(rawText);
+
+      for (const item of events) {
+        if (item.event === 'message' && item.message) {
+          try {
+            const payload = JSON.parse(item.message) as RoomEventPayload;
+            this.handleIncomingEvent(payload);
+          } catch {
+            // Ignore malformed inner message
+          }
+        }
+      }
+    } catch {
+      // Network hiccup, will retry on next poll cycle
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 4. Incoming Event Dispatcher & Deduplicator
   // ---------------------------------------------------------------------------
   private handleIncomingEvent(event: RoomEventPayload) {
     if (!event || !event.roomCode || !event.type) return;
 
-    // Filter out messages published by ourselves
-    if (event.senderSessionId === this.clientId) return;
+    // Filter out messages published by ourselves to avoid echo duplication
+    if (event.publisherClientId === this.clientId) return;
 
     // Deduplicate event by composite signature
-    const eventKey = `${event.type}_${event.roomCode}_${event.senderSessionId}_${event.timestamp}_${
+    const dataId =
       typeof event.data === 'object' && event.data !== null && 'id' in event.data
-        ? (event.data as { id: string }).id
-        : ''
-    }`;
+        ? String((event.data as { id: unknown }).id)
+        : typeof event.data === 'object' && event.data !== null && 'message' in event.data && typeof (event.data as { message: unknown }).message === 'object' && (event.data as { message: { id?: string } }).message?.id
+        ? (event.data as { message: { id: string } }).message.id
+        : '';
+
+    const eventKey = `${event.type}_${event.roomCode.toUpperCase()}_${event.senderSessionId}_${event.timestamp}_${dataId}`;
 
     if (this.processedEventIds.has(eventKey)) return;
     this.processedEventIds.add(eventKey);
 
-    // Keep set pruned to avoid memory growth
-    if (this.processedEventIds.size > 2000) {
+    // Keep set pruned to avoid memory bloat
+    if (this.processedEventIds.size > 2500) {
       const first = this.processedEventIds.values().next().value;
       if (first) this.processedEventIds.delete(first);
     }
 
     // Process room metadata announcements
     if (event.type === 'ROOM_ANNOUNCE' && event.data) {
-      const room = event.data as Room;
-      if (room && room.room_code) {
-        const code = room.room_code.toUpperCase();
-        this.cachedDiscoveredRooms.set(code, room);
-        this.roomMetaListeners.forEach((listener) => listener(room));
+      const roomData =
+        typeof event.data === 'object' && event.data !== null && 'room' in event.data
+          ? (event.data as { room: Room }).room
+          : (event.data as Room);
+
+      if (roomData && roomData.room_code) {
+        const upperCode = roomData.room_code.toUpperCase();
+        this.cachedDiscoveredRooms.set(upperCode, roomData);
+        this.roomMetaListeners.forEach((listener) => {
+          try {
+            listener(roomData);
+          } catch (err) {
+            console.error('Error in room meta listener:', err);
+          }
+        });
       }
     }
 
@@ -217,31 +354,29 @@ class NetworkRelay {
   }
 
   // ---------------------------------------------------------------------------
-  // 4. Room Subscription API
+  // 5. Subscription Management
   // ---------------------------------------------------------------------------
   public subscribeToRoom(roomCode: string) {
     const cleanCode = roomCode.trim().toUpperCase();
+    if (!cleanCode) return;
+
     this.subscribedRoomCodes.add(cleanCode);
 
-    // Subscribe via Port 443 WebSocket
+    // 1. Establish real-time WebSocket connection
     this.subscribePort443Room(cleanCode);
 
-    // Subscribe via MQTT
-    this.subscribeMqttRoom(cleanCode);
+    // 2. Start continuous active background HTTP sync poller
+    this.startActivePoller(cleanCode);
 
-    // Also send an initial discover ping in case peers are already online
-    this.publishEvent({
-      type: 'DISCOVER_PING',
-      roomId: '',
-      roomCode: cleanCode,
-      data: { query: 'WHO_IS_ONLINE' },
-    });
+    // 3. Connect MQTT topic
+    this.subscribeMqttRoom(cleanCode);
   }
 
   public unsubscribeFromRoom(roomCode: string) {
     const cleanCode = roomCode.trim().toUpperCase();
     this.subscribedRoomCodes.delete(cleanCode);
 
+    // Close WebSocket
     const ws = this.activeRoomSockets.get(cleanCode);
     if (ws) {
       try {
@@ -252,15 +387,23 @@ class NetworkRelay {
       this.activeRoomSockets.delete(cleanCode);
     }
 
+    // Stop active HTTP poller
+    this.stopActivePoller(cleanCode);
+
+    // Unsubscribe MQTT
     if (this.mqttClient && this.isMqttConnected) {
-      this.mqttClient.unsubscribe(`${TOPIC_PREFIX}_${cleanCode}`);
+      try {
+        this.mqttClient.unsubscribe(`${TOPIC_PREFIX}_${cleanCode}`);
+      } catch {
+        // Ignore
+      }
     }
   }
 
   // ---------------------------------------------------------------------------
-  // 5. Room Metadata Publishing & Discovery
+  // 6. Room Metadata Publishing & Deep Discovery
   // ---------------------------------------------------------------------------
-  public publishRoomMeta(room: Room) {
+  public publishRoomMeta(room: Room, creator?: RoomMember) {
     const cleanCode = room.room_code.toUpperCase();
     this.cachedDiscoveredRooms.set(cleanCode, room);
 
@@ -268,54 +411,104 @@ class NetworkRelay {
       type: 'ROOM_ANNOUNCE',
       roomId: room.id,
       roomCode: cleanCode,
-      senderSessionId: this.clientId,
+      senderSessionId: creator?.session_id || this.clientId,
+      publisherClientId: this.clientId,
       timestamp: Date.now(),
-      data: room,
+      data: { room, creator },
     };
 
     this.broadcastPayload(cleanCode, payload);
   }
 
-  public async fetchRoomMeta(roomCode: string, timeoutMs = 4500): Promise<Room | null> {
+  /**
+   * Resolves room metadata AND extracts historical messages and members
+   * from cached topic storage.
+   */
+  public async fetchRoomMeta(roomCode: string, timeoutMs = 4000): Promise<RoomDiscoveryResult | null> {
     const cleanCode = roomCode.trim().toUpperCase();
 
-    // 1. Fast in-memory check
-    if (this.cachedDiscoveredRooms.has(cleanCode)) {
-      return this.cachedDiscoveredRooms.get(cleanCode)!;
-    }
-
-    // 2. Query HTTPS Port 443 cached messages via ntfy poll API (Ultra-Reliable on mobile 5G)
+    // 1. Check HTTP cached messages from the last 12 hours
     try {
       const topic = `${TOPIC_PREFIX}_${cleanCode}`;
-      const pollUrl = `${NTFY_BASE_URL}/${topic}/json?poll=1&since=24h`;
+      const pollUrl = `${NTFY_BASE_URL}/${topic}/json?poll=1&since=12h`;
       const res = await fetch(pollUrl, { method: 'GET' });
+
       if (res.ok) {
         const text = await res.text();
-        const lines = text.trim().split('\n');
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          try {
-            const raw = JSON.parse(line);
-            if (raw.event === 'message' && raw.message) {
+        const items = parseNtfyJsonStream(text);
+
+        let foundRoom: Room | null = null;
+        const cachedMessages: Message[] = [];
+        const memberMap = new Map<string, RoomMember>();
+
+        for (const raw of items) {
+          if (raw.event === 'message' && raw.message) {
+            try {
               const eventPayload = JSON.parse(raw.message) as RoomEventPayload;
+
               if (eventPayload.type === 'ROOM_ANNOUNCE' && eventPayload.data) {
-                const room = eventPayload.data as Room;
-                if (room && room.room_code && room.room_code.toUpperCase() === cleanCode) {
-                  this.cachedDiscoveredRooms.set(cleanCode, room);
-                  return room;
+                const roomData =
+                  typeof eventPayload.data === 'object' && eventPayload.data !== null && 'room' in eventPayload.data
+                    ? (eventPayload.data as { room: Room }).room
+                    : (eventPayload.data as Room);
+
+                if (roomData && roomData.room_code && roomData.room_code.toUpperCase() === cleanCode) {
+                  foundRoom = roomData;
+                  this.cachedDiscoveredRooms.set(cleanCode, roomData);
+
+                  const creator =
+                    typeof eventPayload.data === 'object' && eventPayload.data !== null && 'creator' in eventPayload.data
+                      ? (eventPayload.data as { creator?: RoomMember }).creator
+                      : undefined;
+                  if (creator && creator.session_id) {
+                    memberMap.set(creator.session_id, creator);
+                  }
                 }
               }
+
+              if (eventPayload.type === 'MESSAGE_SENT' && eventPayload.data) {
+                const msg = (eventPayload.data as { message?: Message }).message;
+                if (msg && msg.id) {
+                  if (!cachedMessages.some((m) => m.id === msg.id)) {
+                    cachedMessages.push(msg);
+                  }
+                }
+              }
+
+              if (eventPayload.type === 'MEMBER_JOINED' && eventPayload.data) {
+                const member = (eventPayload.data as { member?: RoomMember }).member;
+                if (member && member.session_id) {
+                  memberMap.set(member.session_id, member);
+                }
+              }
+            } catch {
+              // Ignore malformed inner message
             }
-          } catch {
-            // Ignore malformed line
           }
+        }
+
+        if (foundRoom) {
+          return {
+            room: foundRoom,
+            cachedMessages: cachedMessages.sort((a, b) => a.created_at - b.created_at),
+            cachedMembers: Array.from(memberMap.values()),
+          };
         }
       }
     } catch {
-      // Network fetch error, continue to live socket discovery
+      // Continue to live socket discovery
     }
 
-    // 3. Live Socket Ping / Wait (if not found in cache)
+    // 2. Fast in-memory check
+    if (this.cachedDiscoveredRooms.has(cleanCode)) {
+      return {
+        room: this.cachedDiscoveredRooms.get(cleanCode)!,
+        cachedMessages: [],
+        cachedMembers: [],
+      };
+    }
+
+    // 3. Live Socket Ping / Wait
     this.subscribeToRoom(cleanCode);
 
     return new Promise((resolve) => {
@@ -325,7 +518,16 @@ class NetworkRelay {
         if (!resolved) {
           resolved = true;
           cleanup();
-          resolve(this.cachedDiscoveredRooms.get(cleanCode) || null);
+          const fallbackRoom = this.cachedDiscoveredRooms.get(cleanCode) || null;
+          resolve(
+            fallbackRoom
+              ? {
+                  room: fallbackRoom,
+                  cachedMessages: [],
+                  cachedMembers: [],
+                }
+              : null
+          );
         }
       }, timeoutMs);
 
@@ -333,7 +535,11 @@ class NetworkRelay {
         if (room.room_code.toUpperCase() === cleanCode && !resolved) {
           resolved = true;
           cleanup();
-          resolve(room);
+          resolve({
+            room,
+            cachedMessages: [],
+            cachedMembers: [],
+          });
         }
       };
 
@@ -344,7 +550,7 @@ class NetworkRelay {
 
       this.roomMetaListeners.add(metaListener);
 
-      // Actively broadcast discover ping so any online peer responds with ROOM_ANNOUNCE
+      // Actively broadcast discover ping so any online peer immediately responds with ROOM_ANNOUNCE
       this.publishEvent({
         type: 'DISCOVER_PING',
         roomId: '',
@@ -355,7 +561,7 @@ class NetworkRelay {
   }
 
   // ---------------------------------------------------------------------------
-  // 6. Broadcast Outgoing Events
+  // 7. Broadcast Outgoing Events
   // ---------------------------------------------------------------------------
   public publishEvent(
     event: Omit<RoomEventPayload, 'senderSessionId' | 'timestamp'> & { senderSessionId?: string }
@@ -364,6 +570,7 @@ class NetworkRelay {
     const fullPayload: RoomEventPayload = {
       ...event,
       senderSessionId: event.senderSessionId || this.clientId,
+      publisherClientId: this.clientId,
       timestamp: Date.now(),
     };
 
@@ -372,23 +579,21 @@ class NetworkRelay {
 
   private broadcastPayload(cleanCode: string, payload: RoomEventPayload) {
     const topic = `${TOPIC_PREFIX}_${cleanCode}`;
+    const serialized = JSON.stringify(payload);
 
-    // A. Broadcast over HTTPS Port 443 (Universal, works everywhere)
+    // A. Broadcast over HTTPS Port 443 (Universal, works on all devices & carriers)
     fetch(`${NTFY_BASE_URL}/${topic}`, {
       method: 'POST',
-      body: JSON.stringify(payload),
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      body: serialized,
     }).catch(() => {
-      // If offline, queue in outbox
+      // If offline, queue in outbox for automatic replay
       this.outboxQueue.push({ topic, payload });
     });
 
     // B. Also broadcast over MQTT (EMQX) if connected
     if (this.mqttClient && this.isMqttConnected) {
       try {
-        this.mqttClient.publish(topic, JSON.stringify(payload), { qos: 0 });
+        this.mqttClient.publish(topic, serialized, { qos: 0 });
       } catch {
         // Handled by outbox
       }
@@ -402,18 +607,17 @@ class NetworkRelay {
     this.outboxQueue = [];
 
     items.forEach(({ topic, payload }) => {
+      const serialized = JSON.stringify(payload);
       fetch(`${NTFY_BASE_URL}/${topic}`, {
         method: 'POST',
-        body: JSON.stringify(payload),
-        headers: { 'Content-Type': 'application/json' },
+        body: serialized,
       }).catch(() => {
-        // Re-queue if still failing
         this.outboxQueue.push({ topic, payload });
       });
 
       if (this.mqttClient && this.isMqttConnected) {
         try {
-          this.mqttClient.publish(topic, JSON.stringify(payload), { qos: 0 });
+          this.mqttClient.publish(topic, serialized, { qos: 0 });
         } catch {
           // Ignore
         }
@@ -422,7 +626,7 @@ class NetworkRelay {
   }
 
   // ---------------------------------------------------------------------------
-  // 7. Event Listeners
+  // 8. Event Listeners & State
   // ---------------------------------------------------------------------------
   public onEvent(listener: NetworkEventListener) {
     this.eventListeners.add(listener);
@@ -443,7 +647,7 @@ class NetworkRelay {
   }
 
   public getIsConnected(): boolean {
-    return this.isMqttConnected || this.activeRoomSockets.size > 0;
+    return this.isMqttConnected || this.activeRoomSockets.size > 0 || this.activeRoomPollers.size > 0;
   }
 }
 
