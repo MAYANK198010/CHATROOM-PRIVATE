@@ -107,6 +107,16 @@ class RoomEngine {
       this.seedInitialDemoRoom();
     }
     this.initNetworkListeners();
+
+    // Periodic heartbeat to keep room discovery fresh on relays
+    setInterval(() => {
+      const now = Date.now();
+      this.rooms.forEach((r) => {
+        if (r.status === 'active' && now < r.expires_at) {
+          networkRelay.publishRoomMeta(r);
+        }
+      });
+    }, 6000);
   }
 
   private initNetworkListeners() {
@@ -135,7 +145,17 @@ class RoomEngine {
 
   private handleIncomingNetworkEvent(event: RoomEventPayload) {
     const { type, roomId, roomCode, data } = event;
-    const room = this.rooms.get(roomId) || this.getRoomByCode(roomCode);
+    let room = this.rooms.get(roomId) || this.getRoomByCode(roomCode);
+
+    // If room is not yet known locally but provided in sync response
+    if (!room && (type === 'SYNC_RESPONSE' || type === 'ROOM_ANNOUNCE') && (data as { room?: Room })?.room) {
+      const netRoom = (data as { room: Room }).room;
+      this.rooms.set(netRoom.id, netRoom);
+      this.saveToStorage();
+      broadcastEvent('ROOM_DISCOVERED', { room: netRoom, roomId: netRoom.id });
+      room = netRoom;
+    }
+
     if (!room) return;
 
     switch (type) {
@@ -309,27 +329,29 @@ class RoomEngine {
         break;
       }
 
+      case 'DISCOVER_PING':
       case 'SYNC_REQUEST': {
+        // Re-announce room metadata immediately
+        networkRelay.publishRoomMeta(room);
+
         // If we have messages or members in this room, respond with current state
         const currentMessages = this.messages.get(room.id) || [];
         const currentMembers = this.members.get(room.id) || [];
         const currentBans = this.bans.get(room.id) || [];
         const currentRequests = this.requests.get(room.id) || [];
 
-        if (currentMessages.length > 0 || currentMembers.length > 0) {
-          networkRelay.publishEvent({
-            type: 'SYNC_RESPONSE',
-            roomId: room.id,
-            roomCode: room.room_code,
-            data: {
-              room,
-              messages: currentMessages,
-              members: currentMembers,
-              bans: currentBans,
-              requests: currentRequests,
-            },
-          });
-        }
+        networkRelay.publishEvent({
+          type: 'SYNC_RESPONSE',
+          roomId: room.id,
+          roomCode: room.room_code,
+          data: {
+            room,
+            messages: currentMessages,
+            members: currentMembers,
+            bans: currentBans,
+            requests: currentRequests,
+          },
+        });
         break;
       }
 
